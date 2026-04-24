@@ -319,6 +319,7 @@ export default function App() {
   }
 
   async function startVoice(target: "main" | "editNotes" = "main") {
+    if (isListening) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -329,9 +330,9 @@ export default function App() {
         }
       });
       const socket = new WebSocket(wsUrl("/api/asr/ws"));
-      const audioContext = new AudioContext();
+      const audioContext = new AudioContext({ latencyHint: "interactive" });
       const source = audioContext.createMediaStreamSource(stream);
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const processor = audioContext.createScriptProcessor(1024, 1, 1);
 
       transcriptRef.current = target === "editNotes" ? editDraft?.notes ?? "" : text;
       asrSocketRef.current = socket;
@@ -389,9 +390,14 @@ export default function App() {
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     void audioContextRef.current?.close();
 
-    if (asrSocketRef.current?.readyState === WebSocket.OPEN) {
-      asrSocketRef.current.send("stop");
-      asrSocketRef.current.close();
+    const socket = asrSocketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send("stop");
+      window.setTimeout(() => {
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+          socket.close();
+        }
+      }, 700);
     }
 
     processorRef.current = null;
@@ -534,16 +540,6 @@ export default function App() {
             </h2>
             <p className="mt-1 text-sm text-slate-300">说一句话，AI 会自动拆分、分类并保存。</p>
           </div>
-          <button
-            aria-label={isListening ? "停止录音" : "开始语音输入"}
-            title={isListening ? "停止录音" : "开始语音输入"}
-            onClick={isListening && listeningTarget === "main" ? stopVoice : () => startVoice("main")}
-            className={`grid h-14 w-14 place-items-center rounded-full text-white shadow-[0_0_34px_rgba(45,212,191,0.34)] transition ${
-              isListening && listeningTarget === "main" ? "bg-coral" : "bg-teal-400 text-slate-950"
-            }`}
-          >
-            {isListening && listeningTarget === "main" ? <X size={24} /> : <Mic size={24} />}
-          </button>
         </div>
 
         <textarea
@@ -552,6 +548,39 @@ export default function App() {
           placeholder="例如：下周二下午三点跟李总聊报价，周五前把正式合同发给他"
           className="mt-4 min-h-28 w-full resize-none rounded-lg border border-white/10 bg-slate-950/45 p-3 text-base outline-none transition focus:border-teal-300 focus:ring-2 focus:ring-teal-300/20"
         />
+
+        <div className="flex min-h-48 flex-col items-center justify-center">
+          <button
+            aria-label={isListening && listeningTarget === "main" ? "松开停止录音" : "按住开始语音输入"}
+            title={isListening && listeningTarget === "main" ? "松开停止录音" : "按住开始语音输入"}
+            onPointerDown={(event) => {
+              event.preventDefault();
+              event.currentTarget.setPointerCapture(event.pointerId);
+              void startVoice("main");
+            }}
+            onPointerUp={(event) => {
+              event.preventDefault();
+              if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                event.currentTarget.releasePointerCapture(event.pointerId);
+              }
+              stopVoice();
+            }}
+            onPointerCancel={stopVoice}
+            onPointerLeave={(event) => {
+              if (isListening && listeningTarget === "main" && event.buttons === 1) stopVoice();
+            }}
+            className={`grid h-28 w-28 place-items-center rounded-full border text-slate-950 shadow-[0_0_54px_rgba(45,212,191,0.38)] transition active:scale-95 ${
+              isListening && listeningTarget === "main"
+                ? "border-coral/60 bg-coral text-white shadow-[0_0_64px_rgba(255,122,89,0.45)]"
+                : "border-teal-200/50 bg-teal-300"
+            }`}
+          >
+            {isListening && listeningTarget === "main" ? <X size={42} /> : <Mic size={42} />}
+          </button>
+          <p className="mt-4 text-sm font-medium text-teal-100">
+            {isListening && listeningTarget === "main" ? "正在听，松开结束" : "按住说话"}
+          </p>
+        </div>
 
         <button
           onClick={parseAndSave}
