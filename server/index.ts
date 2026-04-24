@@ -355,6 +355,18 @@ app.get("/api/health", (_request, response) => {
   response.json({ ok: true });
 });
 
+app.get("/api/env-check", (_request, response) => {
+  response.json({
+    yunwuApiKey: Boolean(process.env.YUNWU_API_KEY),
+    yunwuModel: process.env.YUNWU_MODEL || null,
+    funasrApiKey: Boolean(process.env.FUNASR_API_KEY),
+    dashscopeApiKey: Boolean(process.env.DASHSCOPE_API_KEY),
+    funasrModel: process.env.FUNASR_MODEL || null,
+    port: process.env.PORT || null,
+    apiPort: process.env.API_PORT || null
+  });
+});
+
 app.get("/api/items", (_request, response) => {
   response.json({ items: selectAllItems() });
 });
