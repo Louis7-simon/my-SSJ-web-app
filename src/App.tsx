@@ -1,6 +1,5 @@
 import { CalendarClock, Check, Clock3, Home, ListTodo, Mic, Pencil, Search, Sparkles, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { parseLocally } from "@/lib/parser";
 import { AiParseResult, ItemKind, ParsedItem, SavedItem } from "@/lib/types";
 
 type SpeechRecognitionCtor = new () => SpeechRecognition;
@@ -26,10 +25,6 @@ type DailySummary = {
   suggestions: string[];
   generatedAt: string;
 };
-
-const storageKey = "suishiji.items.v2";
-const legacyStorageKey = "suishiji.items.v1";
-const summaryStoragePrefix = "suishiji.summary.";
 
 const kindLabels: Record<ItemKind, string> = {
   todo: "待办",
@@ -59,62 +54,6 @@ function formatDate(date: string | null) {
 function buildItemTime(item: SavedItem | ParsedItem) {
   if (!item.date && !item.time) return "未设时间";
   return [formatDate(item.date), item.time].filter(Boolean).join(" ");
-}
-
-function createSavedItem(item: ParsedItem): SavedItem {
-  const now = new Date().toISOString();
-  return {
-    ...item,
-    id: crypto.randomUUID(),
-    status: "active",
-    createdAt: now,
-    updatedAt: now
-  };
-}
-
-function normalizeItem(value: unknown): SavedItem | null {
-  if (!value || typeof value !== "object") return null;
-  const raw = value as Record<string, unknown>;
-  const kind = ["todo", "event", "reminder", "note"].includes(String(raw.kind))
-    ? (raw.kind as ItemKind)
-    : ["todo", "event", "reminder", "note"].includes(String(raw.type))
-      ? (raw.type as ItemKind)
-      : "todo";
-  const category =
-    typeof raw.category === "string" && raw.category.trim()
-      ? raw.category
-      : typeof raw.type === "string" && !["todo", "event", "reminder", "note"].includes(raw.type)
-        ? raw.type
-        : kindLabels[kind];
-  const now = new Date().toISOString();
-
-  return {
-    id: typeof raw.id === "string" ? raw.id : crypto.randomUUID(),
-    kind,
-    category,
-    title: typeof raw.title === "string" ? raw.title : "未命名事项",
-    date: typeof raw.date === "string" ? raw.date : null,
-    time: typeof raw.time === "string" ? raw.time : null,
-    reminderMinutesBefore: typeof raw.reminderMinutesBefore === "number" ? raw.reminderMinutesBefore : null,
-    notes: typeof raw.notes === "string" ? raw.notes : "",
-    priority: raw.priority === "low" || raw.priority === "high" ? raw.priority : "medium",
-    sourceText: typeof raw.sourceText === "string" ? raw.sourceText : "",
-    status: raw.status === "done" ? "done" : "active",
-    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : now,
-    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : now
-  };
-}
-
-function getSavedItems() {
-  try {
-    const raw = window.localStorage.getItem(storageKey) ?? window.localStorage.getItem(legacyStorageKey);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map(normalizeItem).filter((item): item is SavedItem => Boolean(item));
-  } catch {
-    return [];
-  }
 }
 
 function groupItemsByTime(items: SavedItem[]) {
@@ -167,12 +106,8 @@ export default function App() {
   const visibleGroups = viewMode === "time" ? groupItemsByTime(filteredItems) : groupItemsByCategory(filteredItems);
 
   useEffect(() => {
-    setItems(getSavedItems());
+    void loadItems();
   }, []);
-
-  useEffect(() => {
-    window.localStorage.setItem(storageKey, JSON.stringify(items));
-  }, [items]);
 
   useEffect(() => {
     setNotificationEnabled("Notification" in window && Notification.permission === "granted");
@@ -190,6 +125,12 @@ export default function App() {
 
     return () => window.clearTimeout(timeout);
   }, [items]);
+
+  async function loadItems() {
+    const response = await fetch("/api/items");
+    const data = (await response.json()) as { items: SavedItem[] };
+    setItems(data.items);
+  }
 
   useEffect(() => {
     const timers = items
@@ -223,23 +164,20 @@ export default function App() {
     setLastAiMessage("");
 
     try {
-      const response = await fetch("/api/ai-parse", {
+      const response = await fetch("/api/capture", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: value, categories })
+        body: JSON.stringify({ text: value })
       });
-      const result = response.ok ? ((await response.json()) as AiParseResult) : { items: [parseLocally(value)], engine: "local" as const };
-      const savedItems = result.items.map(createSavedItem);
+      if (!response.ok) throw new Error("capture failed");
+      const result = (await response.json()) as AiParseResult;
+      const savedItems = result.items as SavedItem[];
       setItems((current) => [...savedItems, ...current]);
       setText("");
       setLastAiMessage(result.engine === "yunwu" ? `AI 已自动保存 ${savedItems.length} 条事项` : `已使用本地解析保存 ${savedItems.length} 条事项`);
       setPage("items");
     } catch {
-      const savedItem = createSavedItem(parseLocally(value));
-      setItems((current) => [savedItem, ...current]);
-      setText("");
-      setLastAiMessage("AI 暂时不可用，已使用本地解析保存");
-      setPage("items");
+      setLastAiMessage("保存失败，请确认后端服务和数据库已启动");
     } finally {
       setIsParsing(false);
     }
@@ -251,56 +189,21 @@ export default function App() {
 
   async function loadOrGenerateDailySummary(force: boolean) {
     const date = todayValue();
-    const key = `${summaryStoragePrefix}${date}`;
-
-    if (!force) {
-      try {
-        const cached = window.localStorage.getItem(key);
-        if (cached) {
-          setDailySummary(JSON.parse(cached) as DailySummary);
-          return;
-        }
-      } catch {
-        // Ignore broken cache and regenerate below.
-      }
-    }
-
-    const summaryItems = getTodayItemsForSummary();
-    if (!summaryItems.length && !force) {
-      setDailySummary({
-        date,
-        engine: "local",
-        summary: "今天还没有明确安排。可以先记录一件最重要的事，AI 会帮你整理出日程规划。",
-        schedule: [],
-        suggestions: ["先录入今天必须完成的事项。", "给重要事项补充时间或截止日期。", "把零散想法先记成备注，稍后再处理。"],
-        generatedAt: new Date().toISOString()
-      });
-      return;
-    }
-
     setIsGeneratingSummary(true);
     try {
       const response = await fetch("/api/daily-summary", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, items: summaryItems })
+        body: JSON.stringify({ date, force })
       });
-      const data = (await response.json()) as Omit<DailySummary, "date" | "generatedAt">;
-      const nextSummary: DailySummary = {
-        date,
-        engine: data.engine,
-        summary: data.summary,
-        schedule: data.schedule ?? [],
-        suggestions: data.suggestions ?? [],
-        generatedAt: new Date().toISOString()
-      };
-      setDailySummary(nextSummary);
-      window.localStorage.setItem(key, JSON.stringify(nextSummary));
+      if (!response.ok) throw new Error("summary failed");
+      const data = (await response.json()) as DailySummary;
+      setDailySummary(data);
     } catch {
       const fallback: DailySummary = {
         date,
         engine: "local",
-        summary: `今天有 ${summaryItems.length} 条待处理事项。建议先处理有明确时间的安排，再处理其他待办。`,
+        summary: `今天有 ${items.length} 条待处理事项。建议先处理有明确时间的安排，再处理其他待办。`,
         schedule: [],
         suggestions: ["先处理最紧急的事项。", "把无日期事项安排到具体时间段。", "给复杂任务拆成更小的下一步。"],
         generatedAt: new Date().toISOString()
@@ -311,16 +214,31 @@ export default function App() {
     }
   }
 
-  function updateItem(id: string, updates: Partial<SavedItem>) {
-    setItems((current) => current.map((item) => (item.id === id ? { ...item, ...updates, updatedAt: new Date().toISOString() } : item)));
+  async function updateItem(id: string, updates: Partial<SavedItem>) {
+    const currentItem = items.find((item) => item.id === id);
+    if (!currentItem) return;
+    const optimisticItem = { ...currentItem, ...updates, updatedAt: new Date().toISOString() };
+    setItems((current) => current.map((item) => (item.id === id ? optimisticItem : item)));
+    const response = await fetch(`/api/items/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(optimisticItem)
+    });
+    if (response.ok) {
+      const data = (await response.json()) as { item: SavedItem };
+      setItems((current) => current.map((item) => (item.id === id ? data.item : item)));
+    }
   }
 
-  function deleteItem(id: string) {
+  async function deleteItem(id: string) {
+    const beforeDelete = items;
     setItems((current) => current.filter((item) => item.id !== id));
+    const response = await fetch(`/api/items/${id}`, { method: "DELETE" });
+    if (!response.ok) setItems(beforeDelete);
   }
 
   function postponeToTomorrow(id: string) {
-    updateItem(id, { date: tomorrowValue(), status: "active" });
+    void updateItem(id, { date: tomorrowValue(), status: "active" });
   }
 
   function startEdit(item: SavedItem) {
@@ -330,7 +248,7 @@ export default function App() {
 
   function saveEdit() {
     if (!editDraft) return;
-    updateItem(editDraft.id, editDraft);
+    void updateItem(editDraft.id, editDraft);
     setEditingId(null);
     setEditDraft(null);
   }
@@ -646,7 +564,7 @@ export default function App() {
       <header className="mb-5 flex items-center justify-between">
         <div>
           <p className="text-sm text-teal-200/75">{new Date().toLocaleDateString("zh-CN", { weekday: "long", month: "long", day: "numeric" })}</p>
-          <h1 className="text-3xl font-semibold tracking-normal text-white">随时记</h1>
+          <h1 className="text-3xl font-semibold tracking-normal text-white">LOUIS的超级助理</h1>
         </div>
         <button
           onClick={enableNotifications}
