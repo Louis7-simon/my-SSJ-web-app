@@ -33,6 +33,12 @@ const kindLabels: Record<ItemKind, string> = {
   note: "备注"
 };
 
+const API_BASE_URL = import.meta.env.PROD ? "https://my-ssj-web-app-production.up.railway.app" : "http://localhost:3001";
+
+function apiUrl(path: string) {
+  return `${API_BASE_URL}${path}`;
+}
+
 function todayValue() {
   return new Date().toLocaleDateString("en-CA");
 }
@@ -127,7 +133,7 @@ export default function App() {
   }, [items]);
 
   async function loadItems() {
-    const response = await fetch("/api/items");
+    const response = await fetch(apiUrl("/api/items"));
     const data = (await response.json()) as { items: SavedItem[] };
     setItems(data.items);
   }
@@ -164,7 +170,7 @@ export default function App() {
     setLastAiMessage("");
 
     try {
-      const response = await fetch("/api/capture", {
+      const response = await fetch(apiUrl("/api/capture"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: value })
@@ -191,7 +197,7 @@ export default function App() {
     const date = todayValue();
     setIsGeneratingSummary(true);
     try {
-      const response = await fetch("/api/daily-summary", {
+      const response = await fetch(apiUrl("/api/daily-summary"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ date, force })
@@ -219,7 +225,7 @@ export default function App() {
     if (!currentItem) return;
     const optimisticItem = { ...currentItem, ...updates, updatedAt: new Date().toISOString() };
     setItems((current) => current.map((item) => (item.id === id ? optimisticItem : item)));
-    const response = await fetch(`/api/items/${id}`, {
+    const response = await fetch(apiUrl(`/api/items/${id}`), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(optimisticItem)
@@ -233,7 +239,7 @@ export default function App() {
   async function deleteItem(id: string) {
     const beforeDelete = items;
     setItems((current) => current.filter((item) => item.id !== id));
-    const response = await fetch(`/api/items/${id}`, { method: "DELETE" });
+    const response = await fetch(apiUrl(`/api/items/${id}`), { method: "DELETE" });
     if (!response.ok) setItems(beforeDelete);
   }
 

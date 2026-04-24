@@ -10,9 +10,13 @@ import type { AiParseResult, ItemKind, ParsedItem, SavedItem } from "../lib/type
 dotenv.config();
 
 const app = express();
-const port = Number(process.env.API_PORT || 3001);
+const port = Number(process.env.PORT || process.env.API_PORT || 3001);
 
-app.use(cors());
+app.use(
+  cors({
+    origin: ["https://my-ssj-web-app-production.up.railway.app", "http://localhost:5173"]
+  })
+);
 app.use(express.json({ limit: "1mb" }));
 
 function isItemKind(value: unknown): value is ItemKind {
@@ -346,6 +350,6 @@ app.use((_request, response) => {
   response.sendFile(path.join(distPath, "index.html"));
 });
 
-app.listen(port, () => {
-  console.log(`API server running at http://localhost:${port}`);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`后端服务运行在端口 ${port}`);
 });
