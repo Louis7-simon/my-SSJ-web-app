@@ -1,0 +1,16 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+.next/
+build/
+
+# 环境变量
+.env*
+
+# 缓存/编辑器
+.codex/
+.vscode/
+.DS_Store
+*.tsbuildinfo
