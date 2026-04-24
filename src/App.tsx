@@ -39,6 +39,43 @@ function apiUrl(path: string) {
   return `${API_BASE_URL}${path}`;
 }
 
+function wsUrl(path: string) {
+  return `${API_BASE_URL.replace(/^http/, "ws")}${path}`;
+}
+
+function downsampleBuffer(buffer: Float32Array, inputSampleRate: number, outputSampleRate: number) {
+  if (outputSampleRate === inputSampleRate) return buffer;
+  const sampleRateRatio = inputSampleRate / outputSampleRate;
+  const newLength = Math.round(buffer.length / sampleRateRatio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+    let accumulator = 0;
+    let count = 0;
+    for (let index = offsetBuffer; index < nextOffsetBuffer && index < buffer.length; index += 1) {
+      accumulator += buffer[index];
+      count += 1;
+    }
+    result[offsetResult] = accumulator / count;
+    offsetResult += 1;
+    offsetBuffer = nextOffsetBuffer;
+  }
+
+  return result;
+}
+
+function encodePcm16(samples: Float32Array) {
+  const pcm = new Int16Array(samples.length);
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[index]));
+    pcm[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+  }
+  return pcm.buffer;
+}
+
 function todayValue() {
   return new Date().toLocaleDateString("en-CA");
 }
@@ -100,6 +137,12 @@ export default function App() {
   const [notificationEnabled, setNotificationEnabled] = useState(false);
   const [lastAiMessage, setLastAiMessage] = useState("");
   const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const asrSocketRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const transcriptRef = useRef("");
 
   const categories = useMemo(() => Array.from(new Set(items.map((item) => item.category).filter(Boolean))), [items]);
   const todayItems = items.filter((item) => item.status === "active" && item.date === todayValue());
@@ -264,45 +307,98 @@ export default function App() {
     setEditDraft(null);
   }
 
-  function startVoice(target: "main" | "editNotes" = "main") {
-    const win = window as Window & {
-      SpeechRecognition?: SpeechRecognitionCtor;
-      webkitSpeechRecognition?: SpeechRecognitionCtor;
-    };
-    const Recognition = win.SpeechRecognition || win.webkitSpeechRecognition;
-    if (!Recognition) {
-      alert("当前浏览器不支持语音识别，可以先用文字输入。");
-      return;
-    }
+  function applyTranscript(target: "main" | "editNotes", transcript: string) {
+    const textValue = transcript.trim();
+    if (!textValue) return;
 
-    const recognition = new Recognition();
-    recognition.lang = "zh-CN";
-    recognition.interimResults = false;
-    recognition.continuous = false;
-    recognition.onresult = (event) => {
-      const transcript = event.results[0]?.[0]?.transcript ?? "";
-      if (target === "editNotes") {
-        setEditDraft((current) => (current ? { ...current, notes: current.notes ? `${current.notes} ${transcript}` : transcript } : current));
-      } else {
-        setText((current) => (current ? `${current} ${transcript}` : transcript));
-      }
-    };
-    recognition.onend = () => {
+    if (target === "editNotes") {
+      setEditDraft((current) => (current ? { ...current, notes: textValue } : current));
+    } else {
+      setText(textValue);
+    }
+  }
+
+  async function startVoice(target: "main" | "editNotes" = "main") {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      const socket = new WebSocket(wsUrl("/api/asr/ws"));
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+      transcriptRef.current = target === "editNotes" ? editDraft?.notes ?? "" : text;
+      asrSocketRef.current = socket;
+      audioContextRef.current = audioContext;
+      mediaStreamRef.current = stream;
+      sourceRef.current = source;
+      processorRef.current = processor;
+      setListeningTarget(target);
+      setIsListening(true);
+
+      socket.binaryType = "arraybuffer";
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(String(event.data)) as { type?: string; text?: string; message?: string };
+          if (data.type === "transcript" && data.text) {
+            transcriptRef.current = data.text;
+            applyTranscript(target, data.text);
+          }
+          if (data.type === "error") {
+            alert(data.message || "语音识别失败，请稍后再试。");
+            stopVoice();
+          }
+        } catch {
+          // Ignore non-JSON messages.
+        }
+      };
+      socket.onclose = () => {
+        stopVoice();
+      };
+      socket.onerror = () => {
+        alert("语音服务连接失败，请确认后端服务已启动。");
+        stopVoice();
+      };
+
+      processor.onaudioprocess = (event) => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        const input = event.inputBuffer.getChannelData(0);
+        const samples = downsampleBuffer(input, audioContext.sampleRate, 16000);
+        socket.send(encodePcm16(samples));
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+    } catch {
+      alert("无法访问麦克风，请检查浏览器权限。");
       setIsListening(false);
       setListeningTarget(null);
-    };
-    recognition.onerror = () => {
-      setIsListening(false);
-      setListeningTarget(null);
-    };
-    recognitionRef.current = recognition;
-    setListeningTarget(target);
-    setIsListening(true);
-    recognition.start();
+    }
   }
 
   function stopVoice() {
     recognitionRef.current?.stop();
+    processorRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    void audioContextRef.current?.close();
+
+    if (asrSocketRef.current?.readyState === WebSocket.OPEN) {
+      asrSocketRef.current.send("stop");
+      asrSocketRef.current.close();
+    }
+
+    processorRef.current = null;
+    sourceRef.current = null;
+    mediaStreamRef.current = null;
+    audioContextRef.current = null;
+    asrSocketRef.current = null;
     setIsListening(false);
     setListeningTarget(null);
   }

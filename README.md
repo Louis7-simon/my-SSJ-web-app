@@ -46,6 +46,8 @@ http://localhost:3001
 YUNWU_API_KEY=
 YUNWU_MODEL=
 YUNWU_API_BASE_URL=https://yunwu.ai/v1
+FUNASR_API_KEY=
+FUNASR_MODEL=paraformer-realtime-v2
 DATABASE_PATH=data/suishiji.db
 API_PORT=3001
 ```

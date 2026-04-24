@@ -1,8 +1,11 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
+import { createServer } from "node:http";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { WebSocket, WebSocketServer } from "ws";
 import { db, createId, type DailySummaryRow, type ItemRow } from "./db";
 import { parseLocally } from "../lib/parser";
 import type { AiParseResult, ItemKind, ParsedItem, SavedItem } from "../lib/types";
@@ -10,7 +13,10 @@ import type { AiParseResult, ItemKind, ParsedItem, SavedItem } from "../lib/type
 dotenv.config();
 
 const app = express();
-const port = Number(process.env.PORT || process.env.API_PORT || 3001);
+const server = createServer(app);
+const primaryPort = Number(process.env.PORT || process.env.API_PORT || 3001);
+const secondaryPort = Number(process.env.API_PORT || 0);
+const asrServer = new WebSocketServer({ noServer: true });
 
 app.use(
   cors({
@@ -18,6 +24,20 @@ app.use(
   })
 );
 app.use(express.json({ limit: "1mb" }));
+
+server.on("upgrade", (request, socket, head) => {
+  if (request.url?.startsWith("/api/asr/ws")) {
+    asrServer.handleUpgrade(request, socket, head, (ws) => {
+      asrServer.emit("connection", ws, request);
+    });
+    return;
+  }
+  socket.destroy();
+});
+
+asrServer.on("connection", (ws) => {
+  setupAsrSocket(ws);
+});
 
 function isItemKind(value: unknown): value is ItemKind {
   return value === "todo" || value === "event" || value === "reminder" || value === "note";
@@ -48,6 +68,145 @@ function parseJsonArray(value: string) {
   } catch {
     return [];
   }
+}
+
+function extractTranscript(message: unknown) {
+  const payload = (message as { payload?: { output?: unknown } })?.payload;
+  const output = payload?.output as Record<string, unknown> | undefined;
+  const sentence = output?.sentence as Record<string, unknown> | undefined;
+  const candidates = [
+    sentence?.text,
+    output?.text,
+    output?.transcription,
+    output?.sentence
+  ];
+  const value = candidates.find((candidate) => typeof candidate === "string" && candidate.trim());
+  return typeof value === "string" ? value : "";
+}
+
+function setupAsrSocket(client: WebSocket) {
+  const apiKey = process.env.FUNASR_API_KEY || process.env.DASHSCOPE_API_KEY;
+  const model = process.env.FUNASR_MODEL || "paraformer-realtime-v2";
+
+  if (!apiKey) {
+    client.send(JSON.stringify({ type: "error", message: "Missing FUNASR_API_KEY." }));
+    client.close();
+    return;
+  }
+
+  const taskId = randomUUID();
+  const dashscope = new WebSocket("wss://dashscope.aliyuncs.com/api-ws/v1/inference", {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "X-DashScope-DataInspection": "enable"
+    }
+  });
+  let dashscopeReady = false;
+  const pendingAudio: Buffer[] = [];
+
+  dashscope.on("open", () => {
+    dashscope.send(
+      JSON.stringify({
+        header: {
+          action: "run-task",
+          task_id: taskId,
+          streaming: "duplex"
+        },
+        payload: {
+          task_group: "audio",
+          task: "asr",
+          function: "recognition",
+          model,
+          parameters: {
+            format: "pcm",
+            sample_rate: 16000,
+            language_hints: ["zh"]
+          },
+          input: {}
+        }
+      })
+    );
+  });
+
+  dashscope.on("message", (raw) => {
+    try {
+      const data = JSON.parse(raw.toString());
+      const event = data.header?.event;
+
+      if (event === "task-started") {
+        dashscopeReady = true;
+        client.send(JSON.stringify({ type: "ready" }));
+        while (pendingAudio.length && dashscope.readyState === WebSocket.OPEN) {
+          dashscope.send(pendingAudio.shift()!);
+        }
+        return;
+      }
+
+      if (event === "result-generated") {
+        const text = extractTranscript(data);
+        if (text) client.send(JSON.stringify({ type: "transcript", text }));
+        return;
+      }
+
+      if (event === "task-finished") {
+        client.send(JSON.stringify({ type: "finished" }));
+        client.close();
+        return;
+      }
+
+      if (event === "task-failed") {
+        client.send(JSON.stringify({ type: "error", message: data.header?.error_message || "ASR task failed." }));
+        client.close();
+      }
+    } catch {
+      // Ignore malformed provider messages.
+    }
+  });
+
+  dashscope.on("error", () => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: "error", message: "FunASR connection failed." }));
+      client.close();
+    }
+  });
+
+  dashscope.on("close", () => {
+    if (client.readyState === WebSocket.OPEN) client.close();
+  });
+
+  client.on("message", (raw, isBinary) => {
+    if (!isBinary) {
+      const message = raw.toString();
+      if (message === "stop" && dashscope.readyState === WebSocket.OPEN) {
+        dashscope.send(
+          JSON.stringify({
+            header: {
+              action: "finish-task",
+              task_id: taskId,
+              streaming: "duplex"
+            },
+            payload: {
+              input: {}
+            }
+          })
+        );
+      }
+      return;
+    }
+
+    const audio = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as ArrayBuffer);
+    if (dashscopeReady && dashscope.readyState === WebSocket.OPEN) {
+      dashscope.send(audio);
+    } else {
+      pendingAudio.push(audio);
+    }
+  });
+
+  client.on("close", () => {
+    if (dashscope.readyState === WebSocket.OPEN || dashscope.readyState === WebSocket.CONNECTING) {
+      dashscope.close();
+    }
+  });
 }
 
 function selectAllItems() {
@@ -350,6 +509,12 @@ app.use((_request, response) => {
   response.sendFile(path.join(distPath, "index.html"));
 });
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(`后端服务运行在端口 ${port}`);
+server.listen(primaryPort, "0.0.0.0", () => {
+  console.log(`后端服务运行在端口 ${primaryPort}`);
 });
+
+if (secondaryPort && secondaryPort !== primaryPort) {
+  createServer(app).listen(secondaryPort, "0.0.0.0", () => {
+    console.log(`后端服务同时监听端口 ${secondaryPort}`);
+  });
+}
