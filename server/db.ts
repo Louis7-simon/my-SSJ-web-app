@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { SavedItem } from "../lib/types";
+import type { SavedItem } from "../lib/types.ts";
 
 const databasePath = process.env.DATABASE_PATH || "data/suishiji.db";
 const resolvedDatabasePath = path.resolve(process.cwd(), databasePath);

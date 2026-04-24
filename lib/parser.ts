@@ -1,4 +1,4 @@
-import type { ParsedItem } from "@/lib/types";
+import type { ParsedItem } from "./types.ts";
 
 const zhNumberMap: Record<string, number> = {
   零: 0,

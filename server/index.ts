@@ -6,9 +6,9 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
-import { db, createId, type DailySummaryRow, type ItemRow } from "./db";
-import { parseLocally } from "../lib/parser";
-import type { AiParseResult, ItemKind, ParsedItem, SavedItem } from "../lib/types";
+import { db, createId, type DailySummaryRow, type ItemRow } from "./db.ts";
+import { parseLocally } from "../lib/parser.ts";
+import type { AiParseResult, ItemKind, ParsedItem, SavedItem } from "../lib/types.ts";
 
 dotenv.config();
 
