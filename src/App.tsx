@@ -143,6 +143,7 @@ export default function App() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const transcriptRef = useRef("");
+  const forceCloseTimerRef = useRef<number | null>(null);
 
   const categories = useMemo(() => Array.from(new Set(items.map((item) => item.category).filter(Boolean))), [items]);
   const todayItems = items.filter((item) => item.status === "active" && item.date === todayValue());
@@ -320,6 +321,7 @@ export default function App() {
 
   async function startVoice(target: "main" | "editNotes" = "main") {
     if (isListening) return;
+    if (asrSocketRef.current) cleanupVoiceResources(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -351,20 +353,23 @@ export default function App() {
             transcriptRef.current = data.text;
             applyTranscript(target, data.text);
           }
+          if (data.type === "finished") {
+            cleanupVoiceResources();
+          }
           if (data.type === "error") {
             alert(data.message || "语音识别失败，请稍后再试。");
-            stopVoice();
+            cleanupVoiceResources(true);
           }
         } catch {
           // Ignore non-JSON messages.
         }
       };
       socket.onclose = () => {
-        stopVoice();
+        cleanupVoiceResources();
       };
       socket.onerror = () => {
         alert("语音服务连接失败，请确认后端服务已启动。");
-        stopVoice();
+        cleanupVoiceResources(true);
       };
 
       processor.onaudioprocess = (event) => {
@@ -393,11 +398,34 @@ export default function App() {
     const socket = asrSocketRef.current;
     if (socket?.readyState === WebSocket.OPEN) {
       socket.send("stop");
-      window.setTimeout(() => {
+      forceCloseTimerRef.current = window.setTimeout(() => {
         if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
           socket.close();
         }
-      }, 700);
+      }, 8000);
+    }
+
+    processorRef.current = null;
+    sourceRef.current = null;
+    mediaStreamRef.current = null;
+    audioContextRef.current = null;
+    setIsListening(false);
+  }
+
+  function cleanupVoiceResources(closeSocket = false) {
+    recognitionRef.current?.stop();
+    processorRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    void audioContextRef.current?.close();
+    if (forceCloseTimerRef.current) {
+      window.clearTimeout(forceCloseTimerRef.current);
+      forceCloseTimerRef.current = null;
+    }
+
+    const socket = asrSocketRef.current;
+    if (closeSocket && socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      socket.close();
     }
 
     processorRef.current = null;

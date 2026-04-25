@@ -70,7 +70,7 @@ function parseJsonArray(value: string) {
   }
 }
 
-function extractTranscript(message: unknown) {
+function extractSentence(message: unknown) {
   const payload = (message as { payload?: { output?: unknown } })?.payload;
   const output = payload?.output as Record<string, unknown> | undefined;
   const sentence = output?.sentence as Record<string, unknown> | undefined;
@@ -81,12 +81,16 @@ function extractTranscript(message: unknown) {
     output?.sentence
   ];
   const value = candidates.find((candidate) => typeof candidate === "string" && candidate.trim());
-  return typeof value === "string" ? value : "";
+  const text = typeof value === "string" ? value : "";
+  return {
+    text,
+    ended: sentence?.sentence_end === true || output?.sentence_end === true
+  };
 }
 
 function setupAsrSocket(client: WebSocket) {
   const apiKey = process.env.FUNASR_API_KEY || process.env.DASHSCOPE_API_KEY;
-  const model = process.env.FUNASR_MODEL || "paraformer-realtime-v2";
+  const model = process.env.FUNASR_MODEL || "fun-asr-realtime";
 
   if (!apiKey) {
     client.send(JSON.stringify({ type: "error", message: "Missing FUNASR_API_KEY." }));
@@ -102,6 +106,8 @@ function setupAsrSocket(client: WebSocket) {
     }
   });
   let dashscopeReady = false;
+  let finalizedTranscript = "";
+  let stopRequested = false;
   const pendingAudio: Buffer[] = [];
 
   dashscope.on("open", () => {
@@ -143,8 +149,12 @@ function setupAsrSocket(client: WebSocket) {
       }
 
       if (event === "result-generated") {
-        const text = extractTranscript(data);
-        if (text) client.send(JSON.stringify({ type: "transcript", text }));
+        const sentence = extractSentence(data);
+        if (sentence.text) {
+          const fullText = `${finalizedTranscript}${sentence.text}`.trim();
+          client.send(JSON.stringify({ type: "transcript", text: fullText, final: sentence.ended }));
+          if (sentence.ended) finalizedTranscript = fullText;
+        }
         return;
       }
 
@@ -177,7 +187,8 @@ function setupAsrSocket(client: WebSocket) {
   client.on("message", (raw, isBinary) => {
     if (!isBinary) {
       const message = raw.toString();
-      if (message === "stop" && dashscope.readyState === WebSocket.OPEN) {
+      if (message === "stop" && dashscope.readyState === WebSocket.OPEN && !stopRequested) {
+        stopRequested = true;
         dashscope.send(
           JSON.stringify({
             header: {
