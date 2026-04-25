@@ -1,19 +1,29 @@
+import "dotenv/config";
 import cors from "cors";
-import dotenv from "dotenv";
 import express from "express";
 import { createServer } from "node:http";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
-import { db, createId, type DailySummaryRow, type ItemRow } from "./db.ts";
 import { parseLocally } from "../lib/parser.ts";
 import type { AiParseResult, ItemKind, ParsedItem, SavedItem } from "../lib/types.ts";
-
-dotenv.config();
+import {
+  createId,
+  createItems,
+  deleteItem as deleteStoredItem,
+  getDailySummary,
+  getDatabaseInfo,
+  getItemsForSummary,
+  initStore,
+  listCategories,
+  listItems,
+  updateItem as updateStoredItem,
+  upsertDailySummary,
+  type DailySummaryRow
+} from "./store.ts";
 
 const app = express();
-const server = createServer(app);
 const primaryPort = Number(process.env.PORT || process.env.API_PORT || 3001);
 const secondaryPort = Number(process.env.API_PORT || 0);
 const asrServer = new WebSocketServer({ noServer: true });
@@ -25,15 +35,17 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
-server.on("upgrade", (request, socket, head) => {
-  if (request.url?.startsWith("/api/asr/ws")) {
-    asrServer.handleUpgrade(request, socket, head, (ws) => {
-      asrServer.emit("connection", ws, request);
-    });
-    return;
-  }
-  socket.destroy();
-});
+function attachAsrUpgrade(httpServer: ReturnType<typeof createServer>) {
+  httpServer.on("upgrade", (request, socket, head) => {
+    if (request.url?.startsWith("/api/asr/ws")) {
+      asrServer.handleUpgrade(request, socket, head, (ws) => {
+        asrServer.emit("connection", ws, request);
+      });
+      return;
+    }
+    socket.destroy();
+  });
+}
 
 asrServer.on("connection", (ws) => {
   setupAsrSocket(ws);
@@ -220,79 +232,6 @@ function setupAsrSocket(client: WebSocket) {
   });
 }
 
-function selectAllItems() {
-  return db
-    .prepare(
-      `
-        SELECT * FROM items
-        ORDER BY
-          CASE status WHEN 'active' THEN 0 ELSE 1 END,
-          COALESCE(date, '9999-99-99') ASC,
-          COALESCE(time, '99:99') ASC,
-          createdAt DESC
-      `
-    )
-    .all() as ItemRow[];
-}
-
-function insertItem(item: ParsedItem) {
-  const now = new Date().toISOString();
-  const saved: SavedItem = {
-    ...item,
-    id: createId("item"),
-    status: "active",
-    createdAt: now,
-    updatedAt: now
-  };
-
-  db.prepare(
-    `
-      INSERT INTO items (
-        id, kind, category, title, date, time, reminderMinutesBefore,
-        notes, priority, sourceText, status, createdAt, updatedAt
-      )
-      VALUES (
-        @id, @kind, @category, @title, @date, @time, @reminderMinutesBefore,
-        @notes, @priority, @sourceText, @status, @createdAt, @updatedAt
-      )
-    `
-  ).run(saved);
-
-  return saved;
-}
-
-function updateItem(id: string, item: Partial<SavedItem>) {
-  const current = db.prepare("SELECT * FROM items WHERE id = ?").get(id) as ItemRow | undefined;
-  if (!current) return null;
-
-  const next: SavedItem = {
-    ...current,
-    ...item,
-    id,
-    updatedAt: new Date().toISOString()
-  };
-
-  db.prepare(
-    `
-      UPDATE items SET
-        kind = @kind,
-        category = @category,
-        title = @title,
-        date = @date,
-        time = @time,
-        reminderMinutesBefore = @reminderMinutesBefore,
-        notes = @notes,
-        priority = @priority,
-        sourceText = @sourceText,
-        status = @status,
-        updatedAt = @updatedAt
-      WHERE id = @id
-    `
-  ).run(next);
-
-  return next;
-}
-
 async function callYunwuJson(systemPrompt: string, userContent: string, temperature: number) {
   const apiKey = process.env.YUNWU_API_KEY;
   const model = process.env.YUNWU_MODEL;
@@ -367,19 +306,23 @@ app.get("/api/health", (_request, response) => {
 });
 
 app.get("/api/env-check", (_request, response) => {
+  const database = getDatabaseInfo();
   response.json({
     yunwuApiKey: Boolean(process.env.YUNWU_API_KEY),
     yunwuModel: process.env.YUNWU_MODEL || null,
     funasrApiKey: Boolean(process.env.FUNASR_API_KEY),
     dashscopeApiKey: Boolean(process.env.DASHSCOPE_API_KEY),
     funasrModel: process.env.FUNASR_MODEL || null,
+    databaseProvider: database.provider,
+    databasePath: database.path,
+    railwayVolumePath: database.railwayVolumePath,
     port: process.env.PORT || null,
     apiPort: process.env.API_PORT || null
   });
 });
 
-app.get("/api/items", (_request, response) => {
-  response.json({ items: selectAllItems() });
+app.get("/api/items", async (_request, response) => {
+  response.json({ items: await listItems() });
 });
 
 app.post("/api/capture", async (request, response) => {
@@ -389,19 +332,14 @@ app.post("/api/capture", async (request, response) => {
     return;
   }
 
-  const rows = db.prepare("SELECT DISTINCT category FROM items ORDER BY category ASC").all() as Array<{ category: string }>;
-  const parsed = await parseWithAi(
-    text,
-    rows.map((row) => row.category)
-  );
-  const transaction = db.transaction((items: ParsedItem[]) => items.map(insertItem));
-  const savedItems = transaction(parsed.items);
+  const parsed = await parseWithAi(text, await listCategories());
+  const savedItems = await createItems(parsed.items);
 
   response.json({ ...parsed, items: savedItems });
 });
 
-app.put("/api/items/:id", (request, response) => {
-  const item = updateItem(request.params.id, request.body as Partial<SavedItem>);
+app.put("/api/items/:id", async (request, response) => {
+  const item = await updateStoredItem(request.params.id, request.body as Partial<SavedItem>);
   if (!item) {
     response.status(404).json({ error: "Item not found." });
     return;
@@ -409,9 +347,9 @@ app.put("/api/items/:id", (request, response) => {
   response.json({ item });
 });
 
-app.delete("/api/items/:id", (request, response) => {
-  const result = db.prepare("DELETE FROM items WHERE id = ?").run(request.params.id);
-  if (!result.changes) {
+app.delete("/api/items/:id", async (request, response) => {
+  const deleted = await deleteStoredItem(request.params.id);
+  if (!deleted) {
     response.status(404).json({ error: "Item not found." });
     return;
   }
@@ -421,7 +359,7 @@ app.delete("/api/items/:id", (request, response) => {
 app.post("/api/daily-summary", async (request, response) => {
   const date = String(request.body?.date || new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Shanghai" }));
   const force = Boolean(request.body?.force);
-  const existing = db.prepare("SELECT * FROM daily_summaries WHERE date = ?").get(date) as DailySummaryRow | undefined;
+  const existing = await getDailySummary(date);
 
   if (existing && !force) {
     response.json({
@@ -435,15 +373,7 @@ app.post("/api/daily-summary", async (request, response) => {
     return;
   }
 
-  const savedItems = db
-    .prepare(
-      `
-        SELECT * FROM items
-        WHERE status = 'active' AND (date = ? OR date IS NULL)
-        ORDER BY COALESCE(time, '99:99') ASC, createdAt ASC
-      `
-    )
-    .all(date) as ItemRow[];
+  const savedItems = await getItemsForSummary(date);
   const fallback = {
     engine: "local" as const,
     summary: `今天有 ${savedItems.length} 条待处理事项。建议先处理有明确时间的安排，再处理其他待办。`,
@@ -495,25 +425,7 @@ app.post("/api/daily-summary", async (request, response) => {
     updatedAt: now
   };
 
-  db.prepare(
-    `
-      INSERT INTO daily_summaries (
-        id, date, engine, summary, scheduleJson, suggestionsJson,
-        generatedAt, createdAt, updatedAt
-      )
-      VALUES (
-        @id, @date, @engine, @summary, @scheduleJson, @suggestionsJson,
-        @generatedAt, @createdAt, @updatedAt
-      )
-      ON CONFLICT(date) DO UPDATE SET
-        engine = excluded.engine,
-        summary = excluded.summary,
-        scheduleJson = excluded.scheduleJson,
-        suggestionsJson = excluded.suggestionsJson,
-        generatedAt = excluded.generatedAt,
-        updatedAt = excluded.updatedAt
-    `
-  ).run(row);
+  await upsertDailySummary(row);
 
   response.json({
     date,
@@ -532,12 +444,25 @@ app.use((_request, response) => {
   response.sendFile(path.join(distPath, "index.html"));
 });
 
-server.listen(primaryPort, "0.0.0.0", () => {
-  console.log(`后端服务运行在端口 ${primaryPort}`);
-});
+async function startServer() {
+  await initStore();
 
-if (secondaryPort && secondaryPort !== primaryPort) {
-  createServer(app).listen(secondaryPort, "0.0.0.0", () => {
-    console.log(`后端服务同时监听端口 ${secondaryPort}`);
+  const primaryServer = createServer(app);
+  attachAsrUpgrade(primaryServer);
+  primaryServer.listen(primaryPort, "0.0.0.0", () => {
+    console.log(`后端服务运行在端口 ${primaryPort}`);
   });
+
+  if (secondaryPort && secondaryPort !== primaryPort) {
+    const apiServer = createServer(app);
+    attachAsrUpgrade(apiServer);
+    apiServer.listen(secondaryPort, "0.0.0.0", () => {
+      console.log(`后端服务同时监听端口 ${secondaryPort}`);
+    });
+  }
 }
+
+startServer().catch((error) => {
+  console.error("后端服务启动失败", error);
+  process.exit(1);
+});

@@ -4,7 +4,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SavedItem } from "../lib/types.ts";
 
-const databasePath = process.env.DATABASE_PATH || "data/suishiji.db";
+const railwayVolumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+const databasePath = railwayVolumePath ? path.join(railwayVolumePath, "suishiji.db") : process.env.DATABASE_PATH || "data/suishiji.db";
 const resolvedDatabasePath = path.resolve(process.cwd(), databasePath);
 fs.mkdirSync(path.dirname(resolvedDatabasePath), { recursive: true });
 
@@ -57,4 +58,11 @@ export type DailySummaryRow = {
 
 export function createId(prefix: string) {
   return `${prefix}_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+}
+
+export function getDatabaseInfo() {
+  return {
+    path: resolvedDatabasePath,
+    railwayVolumePath: railwayVolumePath || null
+  };
 }
